@@ -77,8 +77,15 @@ class RandomizedResamplingCVSearcher(object):
             if all_cv_result:
                 self.eval_results[self.current_param_id] = all_cv_result
                 self._evaluate_param(param_save_dir)
+                result_save_path = self.exp_root.joinpath("result.json")
+                with result_save_path.open(encoding="utf-8", mode="w+") as f:
+                    json.dump(self.eval_results, fp=f, cls=NumpyJsonEncoder)
+
             else:
                 self.failed_params[self.current_param_id] = params
+                failed_params_path = self.exp_root.joinpath("failed_params.json")
+                with failed_params_path.open(encoding="utf-8", mode="w+") as f:
+                    json.dump(self.failed_params, fp=f, cls=NumpyJsonEncoder)
 
         failed_params_path = self.exp_root.joinpath("failed_params.json")
         with failed_params_path.open(encoding="utf-8", mode="w+") as f:
