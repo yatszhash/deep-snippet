@@ -35,7 +35,11 @@ class RandomizedResamplingCVSearcher(object):
         self.random_seed = random_seed
         self.model = None
 
-    def fit(self, X, Y, groups=None, evaluate_w_best=True):
+        self.cv_num = None
+
+    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None):
+        self.cv_num = self.n_fold if cv_num is None else cv_num
+
         self.X = X
         self.Y = Y
         self.evaluate_w_best = evaluate_w_best
@@ -128,6 +132,9 @@ class RandomizedResamplingCVSearcher(object):
         all_cv_result = {"params": self.current_params, "cv_info": []}
 
         for n, (train_idx, test_idx) in enumerate(cv_generator):
+            if n >= self.cv_num:
+                break
+
             logger.info("-----------[CV{}] training...---------------".format(n))
 
             cv_save_dir = param_save_dir.joinpath("cv{}".format(n))
@@ -144,6 +151,7 @@ class RandomizedResamplingCVSearcher(object):
         return all_cv_result
 
     def _fit_cv(self, train_idx, test_idx, cv_save_dir):
+        # TODO retry if oom of gpu
         self.model = None
 
         cv_result = {}
@@ -268,6 +276,16 @@ class RandomizedResamplingCVSearcher(object):
         return self.score_fn(Y, Y_pred)
 
     def load_with_id(self, param_id, cv_idx=None):
+        # load from local
+        if param_id not in self.eval_results:
+            saved_param_result_path = self.exp_root.joinpath(param_id).joinpath("result.json")
+
+            # TODO load only cv result
+            if not saved_param_result_path.exists():
+                raise Exception("result for param # {} not exist".format(param_id))
+
+            self.eval_results[param_id] = json.load(saved_param_result_path.open(encoding="utf-8"))
+
         result = self.eval_results[param_id]
 
         self.current_params = result["params"]
@@ -282,7 +300,7 @@ class RandomizedResamplingCVSearcher(object):
             cv_idx = np.argmax([cv["val_score"] for cv in result["cv_info"]])
 
         self.current_pipeline = pickle.load(Path(result["cv_info"][cv_idx]["preprocess_path"]).open(mode="rb"))
-        self.model.load_weights(result["cv_info"][cv_idx]["save_model_path"])
+        self.model.load_weights(result["cv_info"][cv_idx]["model_path"])
 
     def transform(self, x):
         '''
