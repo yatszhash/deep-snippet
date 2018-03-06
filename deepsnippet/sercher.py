@@ -2,14 +2,17 @@ import inspect
 import json
 import logging
 import pickle
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+from keras.callbacks import Callback
 from sklearn.model_selection import ParameterSampler, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.utils import shuffle
+from tensorflow.python.framework.errors_impl import ResourceExhaustedError
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +38,12 @@ class RandomizedResamplingCVSearcher(object):
         self.random_seed = random_seed
         self.model = None
 
-        self.cv_num = None
+        self._cv_num = None
+        self._retry = None
 
-    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None):
-        self.cv_num = self.n_fold if cv_num is None else cv_num
+    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0):
+        self._cv_num = self.n_fold if cv_num is None else cv_num
+        self._retry = retry
 
         self.X = X
         self.Y = Y
@@ -132,8 +137,9 @@ class RandomizedResamplingCVSearcher(object):
         all_cv_result = {"params": self.current_params, "cv_info": []}
 
         for n, (train_idx, test_idx) in enumerate(cv_generator):
-            if n >= self.cv_num:
+            if n >= self._cv_num:
                 break
+            # TODO stop training if gradient vanishing
 
             logger.info("-----------[CV{}] training...---------------".format(n))
 
@@ -186,7 +192,26 @@ class RandomizedResamplingCVSearcher(object):
         self.fit_params["log_filename"] = train_csv_path
         self.fit_params["save_model_path"] = model_path
 
-        history = self.fit_fn(**self.fit_params)
+        current_batch_size = self.fit_params["batch_size"]
+
+        for i in range(self._retry + 1):
+            try:
+                history = self.fit_fn(**self.fit_params)
+                break
+            except ResourceExhaustedError:
+                new_batch_size = ((current_batch_size // 8) - 1) * 8
+
+                if new_batch_size <= 1:
+                    logger.warning("oom error of gpu with batch size %d."
+                                   "batch size can't be smaller. "
+                                   "The train for this params are aborted."
+                                   , current_batch_size)
+                    return False
+
+                logger.warning("oom error of gpu with batch size %d. retry with batch size %d",
+                               current_batch_size, new_batch_size)
+                current_batch_size = new_batch_size
+
 
         cv_result["history"] = history.history
         cv_result["best_train_loss"] = np.max(history.history['loss'])
@@ -320,7 +345,62 @@ class NumpyJsonEncoder(json.JSONEncoder):
             return float(o)
         else:
             return super().default(o)
-#
+
+
+class HopelessStopping(Callback):
+    # TODO monitor weight for gradient vanishing or exploding
+    def __init__(self, monitor='val_loss',
+                 threshold=10, patience=0, verbose=0, mode='auto'):
+        super(HopelessStopping, self).__init__()
+
+        self.monitor = monitor
+        self.threshold = threshold
+        self.patience = patience
+        self.verbose = verbose
+        self.wait = 0
+        self.stopping_epoch = 0
+
+        if mode not in ['auto', 'min', 'max']:
+            warnings.warn('UnhopableStopping mode %s is unknown, '
+                          'fallback to auto mode.' % mode,
+                          RuntimeWarning)
+            mode = 'auto'
+
+        if mode == 'min':
+            self.monitor_op = np.less
+        elif mode == 'max':
+            self.monitor_op = np.greater
+        else:
+            if 'acc' in self.monitor:
+                self.monitor_op = np.greater
+            else:
+                self.monitor_op = np.less
+
+    def on_train_begin(self, logs=None):
+        self.wait = 0
+        self.stopping_epoch = 0
+
+    def on_epoch_end(self, epoch, logs=None):
+        current = logs.get(self.monitor)
+        if current is None:
+            warnings.warn(
+                'Hopeless stopping conditioned on metric `%s` '
+                'which is not available. Available metrics are: %s' %
+                (self.monitor, ','.join(list(logs.keys()))), RuntimeWarning
+            )
+            return
+        if self.monitor_op(current, self.threshold):
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                self.stopping_epoch = epoch
+                self.model.stop_training = True
+
+    def on_train_end(self, logs=None):
+        if self.stopping_epoch > 0 and self.verbose > 0:
+            print('Epoch %05d: stopped because it was hopeless.' % (self.stopping_epoch + 1))
+
 # class TemplateKerasClassifier(KerasClassifier):
 #
 #
