@@ -17,10 +17,11 @@ from tensorflow.python.framework.errors_impl import ResourceExhaustedError
 logger = logging.getLogger(__name__)
 
 
+# TODO extract multiinput mode into subclass
 class RandomizedResamplingCVSearcher(object):
     def __init__(self, create_model_fn, compile_fn, score_fn, fit_fn, preprocess_lists, params_seed, n_iter,
                  exp_root: Path,
-                 n_fold=5, is_multilabel=False, random_seed=123):
+                 n_fold=5, is_multilabel=False, multiinput=0, random_seed=123):
         self.param_dicts = {}
         self.eval_results = {}
         self.failed_params = {}
@@ -35,6 +36,7 @@ class RandomizedResamplingCVSearcher(object):
         self.exp_root = exp_root
         self.n_fold = n_fold
         self.is_multilabel = is_multilabel
+        self.multiinput = multiinput
         self.random_seed = random_seed
         self.model = None
 
@@ -45,11 +47,15 @@ class RandomizedResamplingCVSearcher(object):
         self._cv_num = self.n_fold if cv_num is None else cv_num
         self._retry = retry
 
-        self.X = X
-        self.Y = Y
         self.evaluate_w_best = evaluate_w_best
         self.current_params = None
         self.current_param_id = None
+
+        if self.multiinput:
+            self.dataset = [each_X for each_X in X]
+            self.dataset.extend([Y, groups])
+        else:
+            self.dataset = [X, Y, groups]
 
         logger.info("*****************start parameter search*************************")
         for params in self.params_sampler:
@@ -63,10 +69,10 @@ class RandomizedResamplingCVSearcher(object):
                 cv = StratifiedKFold(n_splits=self.n_fold)
 
             if groups:
-                train_set = shuffle(X, Y, groups, random_state=self.random_seed)
+                train_set = shuffle(*self.dataset, random_state=self.random_seed)
                 cv_generator = cv.split(*train_set)
             else:
-                train_set = shuffle(X, Y, random_state=self.random_seed)
+                train_set = shuffle(*self.dataset, random_state=self.random_seed)
                 cv_generator = cv.split(*train_set)
 
             self.current_param_id = str(uuid4())
@@ -166,9 +172,16 @@ class RandomizedResamplingCVSearcher(object):
         preprocess_path = cv_save_dir.joinpath("preprocess.pickle")
         cv_result["preprocess_path"] = str(preprocess_path)
 
-        processed_X = self.current_pipeline.fit_transform(self.X)
+        processed_X = self.current_pipeline.fit_transform(self.dataset[0])
+
         cv_train_X, cv_valid_X = processed_X[train_idx], processed_X[test_idx]
-        cv_train_Y, cv_valid_Y = self.Y[train_idx], self.Y[test_idx]
+        # TODO support preprocess
+        if self.multiinput:
+            additional_train_Xs = [X[train_idx] for X in self.dataset[1:self.multiinput + 1]]
+            additional_valid_Xs = [X[test_idx] for X in self.dataset[1:self.multiinput + 1]]
+
+        cv_train_Y, cv_valid_Y = self.dataset[self.multiinput + 1][train_idx], self.dataset[self.multiinput + 1][
+            test_idx]
 
         self.model_params = self.filter_params(self.create_model_fn, self.current_params)
         self.model = self.create_model_fn(**self.model_params)
@@ -185,10 +198,20 @@ class RandomizedResamplingCVSearcher(object):
         self.fit_params = self.filter_params(self.fit_fn, self.current_params)
 
         self.fit_params["model"] = self.model
-        self.fit_params["x"] = cv_train_X
+
+        if self.multiinput:
+            self.fit_params["x"] = [cv_train_X]
+            self.fit_params["x"].extend(additional_train_Xs)
+            self.fit_params["valid_x"] = [cv_valid_X]
+            self.fit_params["valid_x"].extend(additional_valid_Xs)
+
+        else:
+            self.fit_params["x"] = cv_train_X
+            self.fit_params["valid_x"] = cv_valid_X
+
         self.fit_params["y"] = cv_train_Y
-        self.fit_params["valid_x"] = cv_valid_X
         self.fit_params["valid_y"] = cv_valid_Y
+
         self.fit_params["log_filename"] = train_csv_path
         self.fit_params["save_model_path"] = model_path
 
@@ -230,7 +253,7 @@ class RandomizedResamplingCVSearcher(object):
                              "The train for this params are aborted.")
                 return False
 
-        cv_train_Y_pred = self.model.predict(cv_train_X)
+        cv_train_Y_pred = self.model.predict(self.fit_params["x"])
         if np.any(np.isnan(cv_train_Y_pred)):
             logging.info("There are some nan in predicted values.\n "
                          "It may be caused by gradient vanishing. "
@@ -241,7 +264,7 @@ class RandomizedResamplingCVSearcher(object):
         logger.info("train score: {}".format(train_score))
         cv_result["train_score"] = train_score
 
-        cv_valid_Y_pred = self.model.predict(cv_valid_X)
+        cv_valid_Y_pred = self.model.predict(self.fit_params["valid_x"])
         if np.any(np.isnan(cv_valid_Y_pred)):
             logging.info("There are some nan in predicted values.\n "
                          "It may be caused by gradient vanishing. "
