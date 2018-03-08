@@ -17,6 +17,8 @@ from tensorflow.python.framework.errors_impl import ResourceExhaustedError
 logger = logging.getLogger(__name__)
 
 
+# TODO add resume parameter search
+# TODO compatible or wrap sklearn estimator
 # TODO extract multiinput mode into subclass
 class RandomizedResamplingCVSearcher(object):
     def __init__(self, create_model_fn, compile_fn, score_fn, fit_fn, preprocess_lists, params_seed, n_iter,
@@ -43,10 +45,11 @@ class RandomizedResamplingCVSearcher(object):
         self._cv_num = None
         self._retry = None
 
-    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0):
+    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0, load_weight_fn=None):
         self._cv_num = self.n_fold if cv_num is None else cv_num
         self._retry = retry
-
+        self.load_weight_fn = load_weight_fn
+        
         self.evaluate_w_best = evaluate_w_best
         self.current_params = None
         self.current_param_id = None
@@ -72,6 +75,7 @@ class RandomizedResamplingCVSearcher(object):
                 train_set = shuffle(*self.dataset, random_state=self.random_seed)
                 cv_generator = cv.split(*train_set)
             else:
+                self.dataset = self.dataset[:-1]
                 train_set = shuffle(*self.dataset, random_state=self.random_seed)
                 cv_generator = cv.split(*train_set)
 
@@ -128,6 +132,7 @@ class RandomizedResamplingCVSearcher(object):
         self.load_with_id(best_param_id)
         logger.info("*****************end parameter search*************************")
 
+        self.load_weight_fn = None
         return deepcopy(self.eval_results), deepcopy(self.failed_params)
 
     #
@@ -163,7 +168,6 @@ class RandomizedResamplingCVSearcher(object):
         return all_cv_result
 
     def _fit_cv(self, train_idx, test_idx, cv_save_dir):
-        # TODO retry if oom of gpu
         self.model = None
 
         cv_result = {}
@@ -186,19 +190,18 @@ class RandomizedResamplingCVSearcher(object):
         self.model_params = self.filter_params(self.create_model_fn, self.current_params)
         self.model = self.create_model_fn(**self.model_params)
 
-        model_path = cv_save_dir.joinpath("model.h5py")
+        if self.load_weight_fn is not None:
+            self.load_weight_params = self.filter_params(self.load_weight_fn, self.current_params)
+            self.load_weight_params["model"] = self.model
+            self.model = self.load_weight_fn(**self.load_weight_params)
 
-        cv_result["model_path"] = str(model_path)
-        train_csv_path = cv_save_dir.joinpath("train_log.csv")
         self.compile_params = self.filter_params(self.compile_fn, self.current_params)
-
         self.compile_params["model"] = self.model
         self.model = self.compile_fn(**self.compile_params)
 
         self.fit_params = self.filter_params(self.fit_fn, self.current_params)
 
         self.fit_params["model"] = self.model
-
         if self.multiinput:
             self.fit_params["x"] = [cv_train_X]
             self.fit_params["x"].extend(additional_train_Xs)
@@ -212,6 +215,9 @@ class RandomizedResamplingCVSearcher(object):
         self.fit_params["y"] = cv_train_Y
         self.fit_params["valid_y"] = cv_valid_Y
 
+        model_path = cv_save_dir.joinpath("model.h5py")
+        cv_result["model_path"] = str(model_path)
+        train_csv_path = cv_save_dir.joinpath("train_log.csv")
         self.fit_params["log_filename"] = train_csv_path
         self.fit_params["save_model_path"] = model_path
 
@@ -347,7 +353,13 @@ class RandomizedResamplingCVSearcher(object):
             # cv_idx = np.argmin([abs(cv["val_score"] - val_score_avg) for cv in result["cv_info"]])
             cv_idx = np.argmax([cv["val_score"] for cv in result["cv_info"]])
 
-        self.current_pipeline = pickle.load(Path(result["cv_info"][cv_idx]["preprocess_path"]).open(mode="rb"))
+        preprocess_path = Path(result["cv_info"][cv_idx]["preprocess_path"])
+
+        if preprocess_path.exists():
+            self.current_pipeline = pickle.load(preprocess_path.open(mode="rb"))
+        else:
+            self.current_pipeline = self._create_preprocess_pipeline(self.current_params)
+            
         self.model.load_weights(result["cv_info"][cv_idx]["model_path"])
 
     def transform(self, x):
@@ -356,8 +368,14 @@ class RandomizedResamplingCVSearcher(object):
         :param x:
         :return:
         '''
-        preprocessed_x = self.current_pipeline.transform(x)
-        pred_y = self.model.predict(preprocessed_x)
+        if self.multiinput:
+            preprocessed_x = self.current_pipeline.transform(x[0])
+            new_x = [preprocessed_x]
+            new_x.extend(x[1:])
+            pred_y = self.model.predict(new_x)
+        else:
+            preprocessed_x = self.current_pipeline.transform(x)
+            pred_y = self.model.predict(preprocessed_x)
 
         return pred_y
 

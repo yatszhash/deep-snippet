@@ -20,14 +20,20 @@ class KerasTextTokenizer(BaseEstimator, TransformerMixin):
 
 class KerasTextPadding(BaseEstimator, TransformerMixin):
 
-    def __init__(self, maxlen):
+    def __init__(self, maxlen, dtype='int32', padding='pre', truncating='pre', value=0.0):
         self.maxlen = maxlen
+        self.dtype = dtype
+        self.padding = padding
+        self.truncating = truncating
+        self.value = value
 
     def fit(self, x):
         return self
 
     def transform(self, x):
-        return sequence.pad_sequences(x, maxlen=self.maxlen)
+        return sequence.pad_sequences(x, maxlen=self.maxlen,
+                                      dtype=self.dtype, padding=self.padding,
+                                      truncating=self.truncating, value=self.value)
 
     def fit_transform(self, X, y=None, **fit_params):
         return self.fit(X).transform(X)
