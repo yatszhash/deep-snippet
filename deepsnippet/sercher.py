@@ -2,22 +2,28 @@ import inspect
 import json
 import logging
 import pickle
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+from keras.callbacks import Callback
 from sklearn.model_selection import ParameterSampler, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.utils import shuffle
+from tensorflow.python.framework.errors_impl import ResourceExhaustedError
 
 logger = logging.getLogger(__name__)
 
 
+# TODO add resume parameter search
+# TODO compatible or wrap sklearn estimator
+# TODO extract multiinput mode into subclass
 class RandomizedResamplingCVSearcher(object):
     def __init__(self, create_model_fn, compile_fn, score_fn, fit_fn, preprocess_lists, params_seed, n_iter,
                  exp_root: Path,
-                 n_fold=5, is_multilabel=False, random_seed=123):
+                 n_fold=5, is_multilabel=False, multiinput=0, random_seed=123):
         self.param_dicts = {}
         self.eval_results = {}
         self.failed_params = {}
@@ -32,19 +38,27 @@ class RandomizedResamplingCVSearcher(object):
         self.exp_root = exp_root
         self.n_fold = n_fold
         self.is_multilabel = is_multilabel
+        self.multiinput = multiinput
         self.random_seed = random_seed
         self.model = None
 
-        self.cv_num = None
+        self._cv_num = None
+        self._retry = None
 
-    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None):
-        self.cv_num = self.n_fold if cv_num is None else cv_num
-
-        self.X = X
-        self.Y = Y
+    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0, load_weight_fn=None):
+        self._cv_num = self.n_fold if cv_num is None else cv_num
+        self._retry = retry
+        self.load_weight_fn = load_weight_fn
+        
         self.evaluate_w_best = evaluate_w_best
         self.current_params = None
         self.current_param_id = None
+
+        if self.multiinput:
+            self.dataset = [each_X for each_X in X]
+            self.dataset.extend([Y, groups])
+        else:
+            self.dataset = [X, Y, groups]
 
         logger.info("*****************start parameter search*************************")
         for params in self.params_sampler:
@@ -58,10 +72,11 @@ class RandomizedResamplingCVSearcher(object):
                 cv = StratifiedKFold(n_splits=self.n_fold)
 
             if groups:
-                train_set = shuffle(X, Y, groups, random_state=self.random_seed)
+                train_set = shuffle(*self.dataset, random_state=self.random_seed)
                 cv_generator = cv.split(*train_set)
             else:
-                train_set = shuffle(X, Y, random_state=self.random_seed)
+                self.dataset = self.dataset[:-1]
+                train_set = shuffle(*self.dataset, random_state=self.random_seed)
                 cv_generator = cv.split(*train_set)
 
             self.current_param_id = str(uuid4())
@@ -117,6 +132,7 @@ class RandomizedResamplingCVSearcher(object):
         self.load_with_id(best_param_id)
         logger.info("*****************end parameter search*************************")
 
+        self.load_weight_fn = None
         return deepcopy(self.eval_results), deepcopy(self.failed_params)
 
     #
@@ -132,8 +148,9 @@ class RandomizedResamplingCVSearcher(object):
         all_cv_result = {"params": self.current_params, "cv_info": []}
 
         for n, (train_idx, test_idx) in enumerate(cv_generator):
-            if n >= self.cv_num:
+            if n >= self._cv_num:
                 break
+            # TODO stop training if gradient vanishing
 
             logger.info("-----------[CV{}] training...---------------".format(n))
 
@@ -151,7 +168,6 @@ class RandomizedResamplingCVSearcher(object):
         return all_cv_result
 
     def _fit_cv(self, train_idx, test_idx, cv_save_dir):
-        # TODO retry if oom of gpu
         self.model = None
 
         cv_result = {}
@@ -160,33 +176,71 @@ class RandomizedResamplingCVSearcher(object):
         preprocess_path = cv_save_dir.joinpath("preprocess.pickle")
         cv_result["preprocess_path"] = str(preprocess_path)
 
-        processed_X = self.current_pipeline.fit_transform(self.X)
+        processed_X = self.current_pipeline.fit_transform(self.dataset[0])
+
         cv_train_X, cv_valid_X = processed_X[train_idx], processed_X[test_idx]
-        cv_train_Y, cv_valid_Y = self.Y[train_idx], self.Y[test_idx]
+        # TODO support preprocess
+        if self.multiinput:
+            additional_train_Xs = [X[train_idx] for X in self.dataset[1:self.multiinput + 1]]
+            additional_valid_Xs = [X[test_idx] for X in self.dataset[1:self.multiinput + 1]]
+
+        cv_train_Y, cv_valid_Y = self.dataset[self.multiinput + 1][train_idx], self.dataset[self.multiinput + 1][
+            test_idx]
 
         self.model_params = self.filter_params(self.create_model_fn, self.current_params)
         self.model = self.create_model_fn(**self.model_params)
 
-        model_path = cv_save_dir.joinpath("model.h5py")
+        if self.load_weight_fn is not None:
+            self.load_weight_params = self.filter_params(self.load_weight_fn, self.current_params)
+            self.load_weight_params["model"] = self.model
+            self.model = self.load_weight_fn(**self.load_weight_params)
 
-        cv_result["model_path"] = str(model_path)
-        train_csv_path = cv_save_dir.joinpath("train_log.csv")
         self.compile_params = self.filter_params(self.compile_fn, self.current_params)
-
         self.compile_params["model"] = self.model
         self.model = self.compile_fn(**self.compile_params)
 
         self.fit_params = self.filter_params(self.fit_fn, self.current_params)
 
         self.fit_params["model"] = self.model
-        self.fit_params["x"] = cv_train_X
+        if self.multiinput:
+            self.fit_params["x"] = [cv_train_X]
+            self.fit_params["x"].extend(additional_train_Xs)
+            self.fit_params["valid_x"] = [cv_valid_X]
+            self.fit_params["valid_x"].extend(additional_valid_Xs)
+
+        else:
+            self.fit_params["x"] = cv_train_X
+            self.fit_params["valid_x"] = cv_valid_X
+
         self.fit_params["y"] = cv_train_Y
-        self.fit_params["valid_x"] = cv_valid_X
         self.fit_params["valid_y"] = cv_valid_Y
+
+        model_path = cv_save_dir.joinpath("model.h5py")
+        cv_result["model_path"] = str(model_path)
+        train_csv_path = cv_save_dir.joinpath("train_log.csv")
         self.fit_params["log_filename"] = train_csv_path
         self.fit_params["save_model_path"] = model_path
 
-        history = self.fit_fn(**self.fit_params)
+        current_batch_size = self.fit_params["batch_size"]
+
+        for i in range(self._retry + 1):
+            try:
+                history = self.fit_fn(**self.fit_params)
+                break
+            except ResourceExhaustedError:
+                new_batch_size = ((current_batch_size // 8) - 1) * 8
+
+                if new_batch_size <= 1:
+                    logger.warning("oom error of gpu with batch size %d."
+                                   "batch size can't be smaller. "
+                                   "The train for this params are aborted."
+                                   , current_batch_size)
+                    return False
+
+                logger.warning("oom error of gpu with batch size %d. retry with batch size %d",
+                               current_batch_size, new_batch_size)
+                current_batch_size = new_batch_size
+
 
         cv_result["history"] = history.history
         cv_result["best_train_loss"] = np.max(history.history['loss'])
@@ -205,7 +259,7 @@ class RandomizedResamplingCVSearcher(object):
                              "The train for this params are aborted.")
                 return False
 
-        cv_train_Y_pred = self.model.predict(cv_train_X)
+        cv_train_Y_pred = self.model.predict(self.fit_params["x"])
         if np.any(np.isnan(cv_train_Y_pred)):
             logging.info("There are some nan in predicted values.\n "
                          "It may be caused by gradient vanishing. "
@@ -216,7 +270,7 @@ class RandomizedResamplingCVSearcher(object):
         logger.info("train score: {}".format(train_score))
         cv_result["train_score"] = train_score
 
-        cv_valid_Y_pred = self.model.predict(cv_valid_X)
+        cv_valid_Y_pred = self.model.predict(self.fit_params["valid_x"])
         if np.any(np.isnan(cv_valid_Y_pred)):
             logging.info("There are some nan in predicted values.\n "
                          "It may be caused by gradient vanishing. "
@@ -299,7 +353,13 @@ class RandomizedResamplingCVSearcher(object):
             # cv_idx = np.argmin([abs(cv["val_score"] - val_score_avg) for cv in result["cv_info"]])
             cv_idx = np.argmax([cv["val_score"] for cv in result["cv_info"]])
 
-        self.current_pipeline = pickle.load(Path(result["cv_info"][cv_idx]["preprocess_path"]).open(mode="rb"))
+        preprocess_path = Path(result["cv_info"][cv_idx]["preprocess_path"])
+
+        if preprocess_path.exists():
+            self.current_pipeline = pickle.load(preprocess_path.open(mode="rb"))
+        else:
+            self.current_pipeline = self._create_preprocess_pipeline(self.current_params)
+            
         self.model.load_weights(result["cv_info"][cv_idx]["model_path"])
 
     def transform(self, x):
@@ -308,8 +368,14 @@ class RandomizedResamplingCVSearcher(object):
         :param x:
         :return:
         '''
-        preprocessed_x = self.current_pipeline.transform(x)
-        pred_y = self.model.predict(preprocessed_x)
+        if self.multiinput:
+            preprocessed_x = self.current_pipeline.transform(x[0])
+            new_x = [preprocessed_x]
+            new_x.extend(x[1:])
+            pred_y = self.model.predict(new_x)
+        else:
+            preprocessed_x = self.current_pipeline.transform(x)
+            pred_y = self.model.predict(preprocessed_x)
 
         return pred_y
 
@@ -320,7 +386,62 @@ class NumpyJsonEncoder(json.JSONEncoder):
             return float(o)
         else:
             return super().default(o)
-#
+
+
+class HopelessStopping(Callback):
+    # TODO monitor weight for gradient vanishing or exploding
+    def __init__(self, monitor='val_loss',
+                 threshold=10, patience=0, verbose=0, mode='auto'):
+        super(HopelessStopping, self).__init__()
+
+        self.monitor = monitor
+        self.threshold = threshold
+        self.patience = patience
+        self.verbose = verbose
+        self.wait = 0
+        self.stopping_epoch = 0
+
+        if mode not in ['auto', 'min', 'max']:
+            warnings.warn('UnhopableStopping mode %s is unknown, '
+                          'fallback to auto mode.' % mode,
+                          RuntimeWarning)
+            mode = 'auto'
+
+        if mode == 'min':
+            self.monitor_op = np.less
+        elif mode == 'max':
+            self.monitor_op = np.greater
+        else:
+            if 'acc' in self.monitor:
+                self.monitor_op = np.greater
+            else:
+                self.monitor_op = np.less
+
+    def on_train_begin(self, logs=None):
+        self.wait = 0
+        self.stopping_epoch = 0
+
+    def on_epoch_end(self, epoch, logs=None):
+        current = logs.get(self.monitor)
+        if current is None:
+            warnings.warn(
+                'Hopeless stopping conditioned on metric `%s` '
+                'which is not available. Available metrics are: %s' %
+                (self.monitor, ','.join(list(logs.keys()))), RuntimeWarning
+            )
+            return
+        if self.monitor_op(current, self.threshold):
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                self.stopping_epoch = epoch
+                self.model.stop_training = True
+
+    def on_train_end(self, logs=None):
+        if self.stopping_epoch > 0 and self.verbose > 0:
+            print('Epoch %05d: stopped because it was hopeless.' % (self.stopping_epoch + 1))
+
 # class TemplateKerasClassifier(KerasClassifier):
 #
 #
