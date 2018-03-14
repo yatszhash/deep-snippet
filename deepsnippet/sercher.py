@@ -16,7 +16,6 @@ from tensorflow.python.framework.errors_impl import ResourceExhaustedError
 
 logger = logging.getLogger(__name__)
 
-
 # TODO add resume parameter search
 # TODO compatible or wrap sklearn estimator
 # TODO extract multiinput mode into subclass
@@ -60,6 +59,10 @@ class RandomizedResamplingCVSearcher(object):
         else:
             self.dataset = [X, Y, groups]
 
+        if not groups:
+            self.dataset = self.dataset[:-1]
+
+
         logger.info("*****************start parameter search*************************")
         for params in self.params_sampler:
             if self.is_multilabel and groups:
@@ -71,13 +74,8 @@ class RandomizedResamplingCVSearcher(object):
             else:
                 cv = StratifiedKFold(n_splits=self.n_fold)
 
-            if groups:
-                train_set = shuffle(*self.dataset, random_state=self.random_seed)
-                cv_generator = cv.split(*train_set)
-            else:
-                self.dataset = self.dataset[:-1]
-                train_set = shuffle(*self.dataset, random_state=self.random_seed)
-                cv_generator = cv.split(*train_set)
+            train_set = shuffle(*self.dataset, random_state=self.random_seed)
+            cv_generator = cv.split(*train_set)
 
             self.current_param_id = str(uuid4())
             self.current_params = params
