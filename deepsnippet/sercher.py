@@ -9,10 +9,13 @@ from uuid import uuid4
 
 import numpy as np
 from keras.callbacks import Callback
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import ParameterSampler, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.utils import shuffle
 from tensorflow.python.framework.errors_impl import ResourceExhaustedError
+
+from deepsnippet.data_generator import MinibatchGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ logger = logging.getLogger(__name__)
 # TODO extract multiinput mode into subclass
 class RandomizedResamplingCVSearcher(object):
     def __init__(self, create_model_fn, compile_fn, score_fn, fit_fn, preprocess_lists, params_seed, n_iter,
-                 exp_root: Path,
+                 exp_root: Path, create_data_generator=None,
                  n_fold=5, is_multilabel=False, multiinput=0, random_seed=123):
         self.param_dicts = {}
         self.eval_results = {}
@@ -33,6 +36,7 @@ class RandomizedResamplingCVSearcher(object):
         self.fit_fn = fit_fn
         # TODO replace with sklearn pipeline
         self.preprocess_lists = preprocess_lists
+        self.create_data_generator = create_data_generator
 
         self.exp_root = exp_root
         self.n_fold = n_fold
@@ -43,6 +47,8 @@ class RandomizedResamplingCVSearcher(object):
 
         self._cv_num = None
         self._retry = None
+        self.train_data_generator = None  # type:MinibatchGenerator
+        self.valid_data_generator = None  # type:MinibatchGenerator
 
     def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0, load_weight_fn=None):
         self._cv_num = self.n_fold if cv_num is None else cv_num
@@ -154,7 +160,6 @@ class RandomizedResamplingCVSearcher(object):
 
             cv_save_dir = param_save_dir.joinpath("cv{}".format(n))
             cv_save_dir.mkdir(exist_ok=True, parents=True)
-
             cv_result = self._fit_cv(train_idx, test_idx, cv_save_dir)
 
             if cv_result:
@@ -173,17 +178,30 @@ class RandomizedResamplingCVSearcher(object):
         self.current_pipeline = self._create_preprocess_pipeline(self.current_params)
         preprocess_path = cv_save_dir.joinpath("preprocess.pickle")
         cv_result["preprocess_path"] = str(preprocess_path)
-
         processed_X = self.current_pipeline.fit_transform(self.dataset[0])
 
-        cv_train_X, cv_valid_X = processed_X[train_idx], processed_X[test_idx]
-        # TODO support preprocess
+        if isinstance(processed_X, np.ndarray):
+            cv_train_X, cv_valid_X = processed_X[train_idx], processed_X[test_idx]
+        else:
+            cv_train_X = [processed_X[idx] for idx in train_idx]
+            cv_valid_X = [processed_X[idx] for idx in test_idx]
+
+        # TODO support preprocess for each input in multiinput
         if self.multiinput:
             additional_train_Xs = [X[train_idx] for X in self.dataset[1:self.multiinput + 1]]
             additional_valid_Xs = [X[test_idx] for X in self.dataset[1:self.multiinput + 1]]
 
         cv_train_Y, cv_valid_Y = self.dataset[self.multiinput + 1][train_idx], self.dataset[self.multiinput + 1][
             test_idx]
+
+        # TODO support data generator
+        if self.create_data_generator is not None:
+            if self.multiinput:
+                raise Exception("unsupported operation")
+
+            self.data_gen_params = self.filter_params(self.create_data_generator, self.current_params)
+            self.train_data_generator = self.create_data_generator(cv_train_X, cv_train_Y, **self.data_gen_params)
+            self.valid_data_generator = self.create_data_generator(cv_valid_X, cv_valid_Y, **self.data_gen_params)
 
         self.model_params = self.filter_params(self.create_model_fn, self.current_params)
         self.model = self.create_model_fn(**self.model_params)
@@ -200,18 +218,26 @@ class RandomizedResamplingCVSearcher(object):
         self.fit_params = self.filter_params(self.fit_fn, self.current_params)
 
         self.fit_params["model"] = self.model
-        if self.multiinput:
-            self.fit_params["x"] = [cv_train_X]
-            self.fit_params["x"].extend(additional_train_Xs)
-            self.fit_params["valid_x"] = [cv_valid_X]
-            self.fit_params["valid_x"].extend(additional_valid_Xs)
+
+        if self.train_data_generator:
+            self.fit_params["generator"] = self.train_data_generator
+            self.fit_params["steps_per_epoch"] = self.train_data_generator.steps_per_epoch
+            self.fit_params["validation_data"] = self.valid_data_generator
+            self.fit_params["validation_steps"] = self.valid_data_generator.steps_per_epoch
 
         else:
-            self.fit_params["x"] = cv_train_X
-            self.fit_params["valid_x"] = cv_valid_X
+            if self.multiinput:
+                self.fit_params["x"] = [cv_train_X]
+                self.fit_params["x"].extend(additional_train_Xs)
+                self.fit_params["valid_x"] = [cv_valid_X]
+                self.fit_params["valid_x"].extend(additional_valid_Xs)
 
-        self.fit_params["y"] = cv_train_Y
-        self.fit_params["valid_y"] = cv_valid_Y
+            else:
+                self.fit_params["x"] = cv_train_X
+                self.fit_params["valid_x"] = cv_valid_X
+
+            self.fit_params["y"] = cv_train_Y
+            self.fit_params["valid_y"] = cv_valid_Y
 
         model_path = cv_save_dir.joinpath("model.h5py")
         cv_result["model_path"] = str(model_path)
@@ -225,6 +251,7 @@ class RandomizedResamplingCVSearcher(object):
             try:
                 history = self.fit_fn(**self.fit_params)
                 break
+            # TODO support datagenerator
             except ResourceExhaustedError:
                 new_batch_size = ((current_batch_size // 8) - 1) * 8
 
@@ -257,7 +284,14 @@ class RandomizedResamplingCVSearcher(object):
                              "The train for this params are aborted.")
                 return False
 
-        cv_train_Y_pred = self.model.predict(self.fit_params["x"])
+        if self.train_data_generator:
+            cv_train_Y_pred = np.vstack([self.model.predict(np.array([x])) for x in cv_train_X])
+        #             _generator(generator=self.fit_params["generator"],
+        #                                                            steps=self.fit_params["steps_per_epoch"],
+        #                                                            use_multiprocessing=True)
+        else:
+            cv_train_Y_pred = self.model.predict(self.fit_params["x"])
+
         if np.any(np.isnan(cv_train_Y_pred)):
             logging.info("There are some nan in predicted values.\n "
                          "It may be caused by gradient vanishing. "
@@ -268,7 +302,13 @@ class RandomizedResamplingCVSearcher(object):
         logger.info("train score: {}".format(train_score))
         cv_result["train_score"] = train_score
 
-        cv_valid_Y_pred = self.model.predict(self.fit_params["valid_x"])
+        if self.valid_data_generator:
+            cv_valid_Y_pred = self.model.predict_generator(generator=self.fit_params["validation_data"],
+                                                           steps=self.fit_params["steps_per_epoch"],
+                                                           use_multiprocessing=True)
+        else:
+            cv_valid_Y_pred = self.model.predict(self.fit_params["valid_x"])
+
         if np.any(np.isnan(cv_valid_Y_pred)):
             logging.info("There are some nan in predicted values.\n "
                          "It may be caused by gradient vanishing. "
@@ -311,6 +351,8 @@ class RandomizedResamplingCVSearcher(object):
             init_params = self.filter_params(_class.__init__, params)
             estimaters.append(("#{}_{}".format(idx, _class.__name__), _class(**init_params)))
 
+        if len(estimaters) == 0:
+            return EmptyEstimator()
         return Pipeline(estimaters)
 
     @staticmethod
@@ -322,13 +364,16 @@ class RandomizedResamplingCVSearcher(object):
     def filter_all_params(self, param_dics):
         self.fit_params = self.filter_params(self.fit_fn, param_dics)
         self.model_params = self.filter_params(self.create_model_fn, param_dics)
-        self.compile_fn = self.filter_params(self.compile_fn, param_dics)
+        self.compile_params = self.filter_params(self.compile_fn, param_dics)
+        if self.create_data_generator:
+            self.data_gen_params = self.filter_params(self.create_data_generator, param_dics)
 
     def score(self, Y, Y_pred):
         return self.score_fn(Y, Y_pred)
 
     def load_with_id(self, param_id, cv_idx=None):
         # load from local
+        # TODO load without result
         if param_id not in self.eval_results:
             saved_param_result_path = self.exp_root.joinpath(param_id).joinpath("result.json")
 
@@ -360,6 +405,7 @@ class RandomizedResamplingCVSearcher(object):
             
         self.model.load_weights(result["cv_info"][cv_idx]["model_path"])
 
+    # TODO evaluate for each instance
     def transform(self, x):
         '''
         predict result
@@ -376,6 +422,17 @@ class RandomizedResamplingCVSearcher(object):
             pred_y = self.model.predict(preprocessed_x)
 
         return pred_y
+
+class EmptyEstimator(BaseEstimator, TransformerMixin):
+
+    def __init__(self):
+        pass
+
+    def fit(self, X, **kwrds):
+        return self
+
+    def transform(self, X, **kwrds):
+        return X
 
 
 class NumpyJsonEncoder(json.JSONEncoder):

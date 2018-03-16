@@ -186,9 +186,9 @@ class MfccParams:
 #         return to_spectrogram(array, self.sample_rate, self.ftt_length, self.stride_length)
 
 class MinibatchGenerator(object):
-    def __init__(self, data: list, target: np.ndarray, minibatch_size=40, max_len=None,
+    def __init__(self, data: list, target: np.ndarray, batch_size, max_len=None,
                  sort_by_len=True, choice_on_epoch=True):
-        self.minibatch_size = minibatch_size
+        self.minibatch_size = batch_size
 
         self.data = data
         self.target = target
@@ -201,7 +201,6 @@ class MinibatchGenerator(object):
 
         if sort_by_len:
             sorted_indices = list(sorted(self._indices, key=lambda i: len(self.data[i])))
-            print(sorted_indices[:10])
             self.data = [self.data[idx] for idx in sorted_indices]
             self.target = self.target[sorted_indices]
 
@@ -221,18 +220,20 @@ class MinibatchGenerator(object):
         if self._cur_index + self.minibatch_size > self.actual_used_size:
             self.flush()
 
-        minibatch_indices = self._current_indices[self._cur_index:self._cur_index + self.minibatch_size]
+        next_idx = self._cur_index + self.minibatch_size
+        minibatch_indices = self._current_indices[self._cur_index:next_idx]
         minibatch_data = [self.data[idx] for idx in minibatch_indices]
         minibatch_target = self.target[minibatch_indices]
 
         minibatch_data = pad_sequences(minibatch_data,
                                        maxlen=min(len(minibatch_data[-1]), self.max_len))
 
+        self._cur_index = next_idx
+
         return (minibatch_data, minibatch_target)
 
-    def next(self):
-        while True:
-            yield self.get_batch()
+    def __next__(self):
+        return self.get_batch()
 
     def flush(self):
         if self.choice_on_epoch:
