@@ -14,6 +14,7 @@ from sklearn.model_selection import ParameterSampler, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.utils import shuffle
 from tensorflow.python.framework.errors_impl import ResourceExhaustedError
+from tqdm import tqdm
 
 from deepsnippet.data_generator import MinibatchGenerator
 
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 class RandomizedResamplingCVSearcher(object):
     def __init__(self, create_model_fn, compile_fn, score_fn, fit_fn, preprocess_lists, params_seed, n_iter,
                  exp_root: Path, create_data_generator=None,
-                 n_fold=5, is_multilabel=False, multiinput=0, random_seed=123):
+                 n_fold=5, is_multilabel=False, multiinput=0, random_seed=None):
         self.param_dicts = {}
         self.eval_results = {}
         self.failed_params = {}
@@ -50,7 +51,8 @@ class RandomizedResamplingCVSearcher(object):
         self.train_data_generator = None  # type:MinibatchGenerator
         self.valid_data_generator = None  # type:MinibatchGenerator
 
-    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0, load_weight_fn=None):
+    def fit(self, X, Y, groups=None, evaluate_w_best=True, cv_num=None, retry=0, load_weight_fn=None,
+            pad_empty=True):
         self._cv_num = self.n_fold if cv_num is None else cv_num
         self._retry = retry
         self.load_weight_fn = load_weight_fn
@@ -72,13 +74,13 @@ class RandomizedResamplingCVSearcher(object):
         logger.info("*****************start parameter search*************************")
         for params in self.params_sampler:
             if self.is_multilabel and groups:
-                cv = StratifiedKFold(n_splits=self.n_fold)
+                cv = StratifiedKFold(n_splits=self.n_fold, random_state=self.random_seed)
 
             elif self.is_multilabel:
-                cv = KFold(n_splits=self.n_fold)
+                cv = KFold(n_splits=self.n_fold, random_state=self.random_seed)
 
             else:
-                cv = StratifiedKFold(n_splits=self.n_fold)
+                cv = StratifiedKFold(n_splits=self.n_fold, random_state=self.random_seed)
 
             train_set = shuffle(*self.dataset, random_state=self.random_seed)
             cv_generator = cv.split(*train_set)
@@ -152,7 +154,11 @@ class RandomizedResamplingCVSearcher(object):
         all_cv_result = {"params": self.current_params, "cv_info": []}
 
         for n, (train_idx, test_idx) in enumerate(cv_generator):
-            if n >= self._cv_num:
+            if isinstance(self._cv_num, list):
+                if n not in self._cv_num:
+                    continue
+
+            elif n >= self._cv_num:
                 break
             # TODO stop training if gradient vanishing
 
@@ -253,6 +259,9 @@ class RandomizedResamplingCVSearcher(object):
                 break
             # TODO support datagenerator
             except ResourceExhaustedError:
+                if i >= self._retry:
+                    raise
+
                 new_batch_size = ((current_batch_size // 8) - 1) * 8
 
                 if new_batch_size <= 1:
@@ -285,40 +294,75 @@ class RandomizedResamplingCVSearcher(object):
                 return False
 
         if self.train_data_generator:
-            cv_train_Y_pred = np.vstack([self.model.predict(np.array([x])) for x in cv_train_X])
-        #             _generator(generator=self.fit_params["generator"],
-        #                                                            steps=self.fit_params["steps_per_epoch"],
-        #                                                            use_multiprocessing=True)
+            train_score = self.score_var_len(cv_train_X, cv_train_Y)
+
         else:
             cv_train_Y_pred = self.model.predict(self.fit_params["x"])
 
-        if np.any(np.isnan(cv_train_Y_pred)):
-            logging.info("There are some nan in predicted values.\n "
-                         "It may be caused by gradient vanishing. "
-                         "The train for this params are aborted.")
-            return False
+            if np.any(np.isnan(cv_train_Y_pred)):
+                logging.info("There are some nan in predicted values.\n "
+                             "It may be caused by gradient vanishing. "
+                             "The train for this params are aborted.")
+                return False
 
-        train_score = self.score_fn(cv_train_Y, cv_train_Y_pred)
+            train_score = self.score_fn(cv_train_Y, cv_train_Y_pred)
+
         logger.info("train score: {}".format(train_score))
         cv_result["train_score"] = train_score
 
         if self.valid_data_generator:
-            cv_valid_Y_pred = self.model.predict_generator(generator=self.fit_params["validation_data"],
-                                                           steps=self.fit_params["steps_per_epoch"],
-                                                           use_multiprocessing=True)
+            valid_score = self.score_var_len(cv_valid_X, cv_valid_Y)
         else:
             cv_valid_Y_pred = self.model.predict(self.fit_params["valid_x"])
 
-        if np.any(np.isnan(cv_valid_Y_pred)):
-            logging.info("There are some nan in predicted values.\n "
-                         "It may be caused by gradient vanishing. "
+            if np.any(np.isnan(cv_valid_Y_pred)):
+                logging.info("There are some nan in predicted values.\n "
+                             "It may be caused by gradient vanishing. "
                          "The train for this params are aborted.")
-            return False
-        valid_score = self.score_fn(cv_valid_Y, cv_valid_Y_pred)
+                return False
+            valid_score = self.score_fn(cv_valid_Y, cv_valid_Y_pred)
         cv_result["val_score"] = valid_score
         logger.info("valid score: {}".format(valid_score))
 
         return cv_result
+
+    # TODO enable limit max batchsize
+    # TODO support multiple input
+    def score_var_len(self, X, Y):
+        pred_Y = self.predict_var_len(X)
+        # Y_indices = list(chain.from_iterable([y[0] for y in predicted]))
+
+        return self.score_fn(Y, pred_Y)
+
+    def predict_var_len(self, X):
+        length = [len(x) for x in X]
+        zero_args = [i for i, x in enumerate(length) if x == 0]
+        X_non_zero = [[0] if idx in zero_args else x for idx, x in enumerate(X)]
+        X_non_zero = [np.array(x) for x in X_non_zero]
+        X_non_zero = sorted(enumerate(X_non_zero), key=lambda x: len(x[1]))
+        all_batches = []
+        temp_batch = []
+        temp_len = 0
+
+        for idx, x in X_non_zero:
+            if temp_len != len(x):
+                all_batches.append(temp_batch)
+                temp_batch = []
+                temp_len = len(x)
+            temp_batch.append((idx, x))
+        else:
+            all_batches.append(temp_batch)
+
+        if len(all_batches[0]) == 0:
+            all_batches = all_batches[1:]
+
+        predicted = [([x[0] for x in batch], model.predict(np.vstack([x[1] for x in batch])))
+                     for batch in tqdm(all_batches)]
+        Y_pred_sorted = np.vstack([y[1] for y in predicted])
+
+        Y_indices = sorted(enumerate(X_non_zero), key=lambda x: x[1][0])
+        Y_indices = [x[0] for x in Y_indices]
+        return Y_pred_sorted[Y_indices, :]
 
     def _evaluate_param(self, param_save_dir):
         train_scores = [cv_result["train_score"] for cv_result in self.eval_results[self.current_param_id]["cv_info"]]
