@@ -356,7 +356,7 @@ class RandomizedResamplingCVSearcher(object):
         if len(all_batches[0]) == 0:
             all_batches = all_batches[1:]
 
-        predicted = [([x[0] for x in batch], model.predict(np.vstack([x[1] for x in batch])))
+        predicted = [([x[0] for x in batch], self.model.predict(np.vstack([x[1] for x in batch])))
                      for batch in tqdm(all_batches)]
         Y_pred_sorted = np.vstack([y[1] for y in predicted])
 
