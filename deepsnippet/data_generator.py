@@ -9,7 +9,7 @@ from keras.preprocessing.sequence import pad_sequences
 # import soundfile
 # from common.utils import text_to_int_sequence
 # from python_speech_features import mfcc
-from sklearn.utils import resample
+from sklearn.utils import resample, shuffle
 
 RANDOM_SEED = 123
 
@@ -187,7 +187,7 @@ class MfccParams:
 
 class MinibatchGenerator(object):
     def __init__(self, data: list, target: np.ndarray, batch_size, max_len=None,
-                 sort_by_len=True, choice_on_epoch=True):
+                 sort_by_len=True, choice_on_epoch=True, sort_batch=True):
         self.minibatch_size = batch_size
 
         self.data = data
@@ -206,30 +206,36 @@ class MinibatchGenerator(object):
 
         # state
         self._cur_index = 0
+        self._cur_batch_num = 0
+
         self._current_indices = list(sorted(resample(self._indices, replace=False,
                                                      n_samples=self.actual_used_size)))
+        # for support sort
+        self._cur_batch_indeices = [self._current_indices[i * self.minibatch_size:(i + 1) * self.minibatch_size]
+                                    for i in range(self.steps_per_epoch)]
 
         self.max_len = max_len
         if not self.max_len:
             self.max_len = np.inf
 
         self.choice_on_epoch = choice_on_epoch
+        self.sort_batch = sort_batch
 
     def get_batch(self):
 
-        if self._cur_index + self.minibatch_size > self.actual_used_size:
+        if self._cur_batch_num >= self.steps_per_epoch:
             self.flush()
-
-        next_idx = self._cur_index + self.minibatch_size
-        minibatch_indices = self._current_indices[self._cur_index:next_idx]
+        #
+        # next_idx = self._cur_index + self.minibatch_size
+        minibatch_indices = self._cur_batch_indeices[self._cur_batch_num]
         minibatch_data = [self.data[idx] for idx in minibatch_indices]
         minibatch_target = self.target[minibatch_indices]
 
         minibatch_data = pad_sequences(minibatch_data,
                                        maxlen=min(len(minibatch_data[-1]), self.max_len))
 
-        self._cur_index = next_idx
-
+        # self._cur_index = next_idx
+        self._cur_batch_num += 1
         return (minibatch_data, minibatch_target)
 
     def __next__(self):
@@ -239,10 +245,15 @@ class MinibatchGenerator(object):
         if self.choice_on_epoch:
             self._current_indices = list(sorted(resample(self._indices, replace=False,
                                                          n_samples=self.actual_used_size)))
+            self._cur_batch_indeices = [self._current_indices[i * self.minibatch_size:(i + 1) * self.minibatch_size]
+                                        for i in range(self.steps_per_epoch)]
+        if self.sort_batch:
+            self._cur_batch_indeices = shuffle(self._cur_batch_indeices)
+            self._cur_batch_indeices = [shuffle(batch_indice) for batch_indice in self._cur_batch_indeices]
 
         self._cur_index = 0
-
-#
+        self._cur_batch_num = 0
+    #
 # class CharDataGenerator(MinibatchGenerator):
 #     max_label_length = max([len(label) for label in LABELS])
 #
